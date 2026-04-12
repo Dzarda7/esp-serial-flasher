@@ -647,6 +647,72 @@ static void image_write(const uint8_t *elf_data,
     (void)pos; /* pos == needed; caller already verified capacity */
 }
 
+/*
+ * If the image contains an ESP-IDF esp_app_desc_t (identified by the
+ * magic word 0xABCD5432), patch its app_elf_sha256 field with the SHA-256
+ * of the original ELF file, then fix up the XOR checksum byte and (if
+ * present) the image-level SHA-256 footer.
+ *
+ * Called after image_write().  Silently skipped for non-ESP-IDF images.
+ */
+#define APP_DESC_MAGIC      0xABCD5432u
+#define APP_ELF_SHA256_OFF  144u    /* offsetof(esp_app_desc_t, app_elf_sha256) */
+
+static void patch_app_elf_sha256(uint8_t *buf, size_t img_size,
+                                 const uint8_t *elf_data, size_t elf_size,
+                                 bool append_sha256)
+{
+    /* footer_sha: the image-level SHA-256 appended after the checksum byte */
+    size_t footer_sha     = append_sha256 ? SHA256_LEN : 0u;
+    size_t body_with_chk  = img_size - footer_sha; /* headers + segs + pad + chk */
+    size_t chk_off        = body_with_chk - 1u;
+
+    /* Scan 4-byte aligned positions in segment area for the magic word. */
+    size_t magic_off = SIZE_MAX;
+    for (size_t i = 0u; i + 4u <= chk_off; i += 4u) {
+        uint32_t w = (uint32_t)buf[i]
+                     | ((uint32_t)buf[i + 1u] << 8u)
+                     | ((uint32_t)buf[i + 2u] << 16u)
+                     | ((uint32_t)buf[i + 3u] << 24u);
+        if (w == APP_DESC_MAGIC) {
+            magic_off = i;
+            break;
+        }
+    }
+
+    if (magic_off == SIZE_MAX) {
+        return; /* No esp_app_desc_t — not an ESP-IDF image. */
+    }
+
+    size_t sha_off = magic_off + APP_ELF_SHA256_OFF;
+    if (sha_off + SHA256_LEN > chk_off) {
+        return; /* Descriptor truncated — skip. */
+    }
+
+    /* Compute SHA-256 of the ELF file. */
+    uint8_t elf_hash[SHA256_LEN];
+    sha256_ctx_t elf_ctx;
+    sha256_init(&elf_ctx);
+    sha256_update(&elf_ctx, elf_data, elf_size);
+    sha256_final(&elf_ctx, elf_hash);
+
+    /* Patch the field; the old bytes were zero (ESP-IDF linker zeroes it).
+     * Update the XOR checksum byte: XOR out old bytes, XOR in new bytes. */
+    for (size_t i = 0u; i < SHA256_LEN; i++) {
+        buf[chk_off] ^= buf[sha_off + i]; /* remove old contribution */
+        buf[sha_off + i] = elf_hash[i];
+        buf[chk_off] ^= elf_hash[i];      /* add new contribution */
+    }
+
+    /* Re-compute the image-level SHA-256 footer (covers everything before it). */
+    if (append_sha256) {
+        sha256_ctx_t img_ctx;
+        sha256_init(&img_ctx);
+        sha256_update(&img_ctx, buf, body_with_chk);
+        sha256_final(&img_ctx, buf + body_with_chk);
+    }
+}
+
 /* -------------------------------------------------------------------------
  * Public API
  * ---------------------------------------------------------------------- */
@@ -692,6 +758,7 @@ esp_loader_error_t esp_loader_elf_to_flash_image(
 
     image_write(elf_data, ci, cfg, segs, n_segs, header_size,
                 n_written_segs, out_buf);
+    patch_app_elf_sha256(out_buf, needed, elf_data, elf_size, cfg->append_sha256);
     *out_size = needed;
     return ESP_LOADER_SUCCESS;
 }
