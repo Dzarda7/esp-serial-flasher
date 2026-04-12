@@ -16,6 +16,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "elf32.h"
@@ -870,4 +871,67 @@ esp_loader_error_t esp_loader_load_elf_to_ram(
 
     esp_loader_mem_cfg_t dummy = {0};
     return esp_loader_mem_finish(loader, &dummy, ehdr->e_entry);
+}
+
+/* -------------------------------------------------------------------------
+ * Task 7 — Flash ELF convenience wrapper
+ * ---------------------------------------------------------------------- */
+
+#define ESP_FLASH_BLOCK 1024u
+
+esp_loader_error_t esp_loader_flash_elf(
+    esp_loader_t               *loader,
+    const uint8_t              *elf_data,
+    size_t                      elf_size,
+    uint32_t                    flash_offset,
+    const esp_loader_elf_cfg_t *cfg)
+{
+    /* Size query. */
+    size_t img_size;
+    RETURN_ON_ERROR(esp_loader_elf_to_flash_image(
+                        elf_data, elf_size,
+                        esp_loader_get_target(loader),
+                        cfg, NULL, &img_size));
+
+    uint8_t *buf = (uint8_t *)malloc(img_size);
+    if (buf == NULL) {
+        return ESP_LOADER_ERROR_FAIL;
+    }
+
+    /* Build image. */
+    esp_loader_error_t err = esp_loader_elf_to_flash_image(
+                                 elf_data, elf_size,
+                                 esp_loader_get_target(loader),
+                                 cfg, buf, &img_size);
+    if (err != ESP_LOADER_SUCCESS) {
+        free(buf);
+        return err;
+    }
+
+    /* Flash. */
+    esp_loader_flash_cfg_t flash_cfg = {
+        .offset     = flash_offset,
+        .image_size = (uint32_t)img_size,
+        .block_size = ESP_FLASH_BLOCK,
+    };
+    err = esp_loader_flash_start(loader, &flash_cfg);
+    if (err != ESP_LOADER_SUCCESS) {
+        free(buf);
+        return err;
+    }
+
+    const uint8_t *p      = buf;
+    size_t         remain = img_size;
+    while (remain > 0 && err == ESP_LOADER_SUCCESS) {
+        uint32_t chunk = (remain < ESP_FLASH_BLOCK) ? (uint32_t)remain : ESP_FLASH_BLOCK;
+        err     = esp_loader_flash_write(loader, &flash_cfg, (void *)p, chunk);
+        p      += chunk;
+        remain -= chunk;
+    }
+
+    free(buf);
+    if (err != ESP_LOADER_SUCCESS) {
+        return err;
+    }
+    return esp_loader_flash_finish(loader, &flash_cfg);
 }
