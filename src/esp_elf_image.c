@@ -302,6 +302,7 @@ static uint32_t round_up4(uint32_t n)
 /* Internal segment descriptor collected from PT_LOAD headers. */
 typedef struct {
     uint32_t vaddr;         /* virtual address */
+    uint32_t filesz;        /* p_filesz (original, unpadded) */
     uint32_t filesz_padded; /* p_filesz rounded up to 4 bytes */
     uint32_t fileoff;       /* byte offset of segment data in the ELF */
     bool     is_flash;      /* true → DROM or IROM (flash-mapped) */
@@ -329,6 +330,7 @@ static esp_loader_error_t collect_segs(const uint8_t *data, size_t size,
         }
         esp_seg_type_t t = elf_classify_segment(chip, ph->p_vaddr, NULL);
         segs[n].vaddr = ph->p_vaddr;
+        segs[n].filesz = ph->p_filesz;
         segs[n].filesz_padded = round_up4(ph->p_filesz);
         segs[n].fileoff = ph->p_offset;
         segs[n].is_flash = (t == ESP_SEG_DROM || t == ESP_SEG_IROM);
@@ -345,10 +347,16 @@ static esp_loader_error_t collect_segs(const uint8_t *data, size_t size,
  * their vaddr (same algorithm as esptool ESP32FirmwareImage.save()).
  * RAM segments fill the gaps, split across descriptors as needed.
  */
+/*
+ * If n_segs_out is non-NULL, the number of segment descriptors written
+ * (including splits) is stored there.
+ */
 static size_t layout_size(const img_seg_t *segs, size_t n,
-                          size_t header_size, bool append_sha256)
+                          size_t header_size, bool append_sha256,
+                          size_t *n_segs_out)
 {
     size_t pos = header_size;
+    size_t n_written = 0;
 
     /* RAM cursor: tracks which RAM segment we are currently consuming
      * and how many bytes of its (padded) data have already been placed. */
@@ -397,6 +405,7 @@ static size_t layout_size(const img_seg_t *segs, size_t n,
                 /* Whole segment fits in the gap. */
                 pos += SEG_HDR_LEN + remaining;
                 gap -= SEG_HDR_LEN + remaining;
+                n_written++;
                 ram_used = 0;
                 ram_idx++;
                 /* Skip any embedded flash segments in the sequence. */
@@ -407,6 +416,7 @@ static size_t layout_size(const img_seg_t *segs, size_t n,
                 /* Split: write avail_data bytes, leave the rest for after IROM. */
                 pos += SEG_HDR_LEN + avail_data;
                 ram_used += avail_data;
+                n_written++;
                 gap = 0;
             }
         }
@@ -414,6 +424,7 @@ static size_t layout_size(const img_seg_t *segs, size_t n,
         /* Place flash segment. */
         pos = target;
         pos += SEG_HDR_LEN + segs[i].filesz_padded;
+        n_written++;
     }
 
     /* Write remaining RAM segments (or the tail of a split one). */
@@ -422,8 +433,13 @@ static size_t layout_size(const img_seg_t *segs, size_t n,
             uint32_t remaining = segs[ram_idx].filesz_padded - ram_used;
             pos += SEG_HDR_LEN + remaining;
             ram_used = 0;
+            n_written++;
         }
         ram_idx++;
+    }
+
+    if (n_segs_out != NULL) {
+        *n_segs_out = n_written;
     }
 
     /* Checksum padding: (15 - pos%16)%16 + 1 bytes (last byte = XOR checksum). */
@@ -438,7 +454,330 @@ static size_t layout_size(const img_seg_t *segs, size_t n,
 }
 
 /* -------------------------------------------------------------------------
- * Public API — Task 3: dry-run (out_buf == NULL)
+ * Task 4 — Image write pass
+ *
+ * Minimal portable SHA-256 (public domain, Brad Conte algorithm).
+ * ---------------------------------------------------------------------- */
+
+#define SHA256_ROTRIGHT(a, b)  (((a) >> (b)) | ((a) << (32u - (b))))
+#define SHA256_CH(x, y, z)     (((x) & (y)) ^ (~(x) & (z)))
+#define SHA256_MAJ(x, y, z)    (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
+#define SHA256_EP0(x)  (SHA256_ROTRIGHT(x,2u)^SHA256_ROTRIGHT(x,13u)^SHA256_ROTRIGHT(x,22u))
+#define SHA256_EP1(x)  (SHA256_ROTRIGHT(x,6u)^SHA256_ROTRIGHT(x,11u)^SHA256_ROTRIGHT(x,25u))
+#define SHA256_SIG0(x) (SHA256_ROTRIGHT(x,7u)^SHA256_ROTRIGHT(x,18u)^((x)>>3u))
+#define SHA256_SIG1(x) (SHA256_ROTRIGHT(x,17u)^SHA256_ROTRIGHT(x,19u)^((x)>>10u))
+
+static const uint32_t SHA256_K[64] = {
+    0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
+    0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+    0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+    0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+    0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+    0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+    0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+    0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+    0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+    0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+    0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
+    0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+    0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
+    0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+    0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+    0x90bffffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u,
+};
+
+typedef struct {
+    uint8_t  data[64];
+    uint32_t datalen;
+    uint64_t bitlen;
+    uint32_t state[8];
+} sha256_ctx_t;
+
+static void sha256_transform(sha256_ctx_t *ctx, const uint8_t d[64])
+{
+    uint32_t a, b, c, e, f, g, h, t1, t2, m[64];
+    uint32_t dd;
+    uint32_t i, j;
+
+    for (i = 0u, j = 0u; i < 16u; i++, j += 4u) {
+        m[i] = ((uint32_t)d[j] << 24u) | ((uint32_t)d[j + 1u] << 16u)
+               | ((uint32_t)d[j + 2u] << 8u) | (uint32_t)d[j + 3u];
+    }
+    for (; i < 64u; i++) {
+        m[i] = SHA256_SIG1(m[i - 2u]) + m[i - 7u]
+               + SHA256_SIG0(m[i - 15u]) + m[i - 16u];
+    }
+
+    a = ctx->state[0]; b = ctx->state[1]; c = ctx->state[2]; dd = ctx->state[3];
+    e = ctx->state[4]; f = ctx->state[5]; g = ctx->state[6]; h  = ctx->state[7];
+
+    for (i = 0u; i < 64u; i++) {
+        t1 = h + SHA256_EP1(e) + SHA256_CH(e, f, g) + SHA256_K[i] + m[i];
+        t2 = SHA256_EP0(a) + SHA256_MAJ(a, b, c);
+        h = g; g = f; f = e; e = dd + t1;
+        dd = c; c = b; b = a; a = t1 + t2;
+    }
+
+    ctx->state[0] += a; ctx->state[1] += b; ctx->state[2] += c; ctx->state[3] += dd;
+    ctx->state[4] += e; ctx->state[5] += f; ctx->state[6] += g; ctx->state[7] += h;
+}
+
+static void sha256_init(sha256_ctx_t *ctx)
+{
+    ctx->datalen  = 0u;
+    ctx->bitlen   = 0u;
+    ctx->state[0] = 0x6a09e667u;
+    ctx->state[1] = 0xbb67ae85u;
+    ctx->state[2] = 0x3c6ef372u;
+    ctx->state[3] = 0xa54ff53au;
+    ctx->state[4] = 0x510e527fu;
+    ctx->state[5] = 0x9b05688cu;
+    ctx->state[6] = 0x1f83d9abu;
+    ctx->state[7] = 0x5be0cd19u;
+}
+
+static void sha256_update(sha256_ctx_t *ctx, const uint8_t *data, size_t len)
+{
+    for (size_t i = 0u; i < len; i++) {
+        ctx->data[ctx->datalen++] = data[i];
+        if (ctx->datalen == 64u) {
+            sha256_transform(ctx, ctx->data);
+            ctx->bitlen += 512u;
+            ctx->datalen = 0u;
+        }
+    }
+}
+
+static void sha256_final(sha256_ctx_t *ctx, uint8_t hash[SHA256_LEN])
+{
+    uint32_t i = ctx->datalen;
+
+    if (ctx->datalen < 56u) {
+        ctx->data[i++] = 0x80u;
+        while (i < 56u) {
+            ctx->data[i++] = 0x00u;
+        }
+    } else {
+        ctx->data[i++] = 0x80u;
+        while (i < 64u) {
+            ctx->data[i++] = 0x00u;
+        }
+        sha256_transform(ctx, ctx->data);
+        memset(ctx->data, 0, 56u);
+    }
+    ctx->bitlen += (uint64_t)ctx->datalen * 8u;
+    ctx->data[63] = (uint8_t)(ctx->bitlen);
+    ctx->data[62] = (uint8_t)(ctx->bitlen >> 8u);
+    ctx->data[61] = (uint8_t)(ctx->bitlen >> 16u);
+    ctx->data[60] = (uint8_t)(ctx->bitlen >> 24u);
+    ctx->data[59] = (uint8_t)(ctx->bitlen >> 32u);
+    ctx->data[58] = (uint8_t)(ctx->bitlen >> 40u);
+    ctx->data[57] = (uint8_t)(ctx->bitlen >> 48u);
+    ctx->data[56] = (uint8_t)(ctx->bitlen >> 56u);
+    sha256_transform(ctx, ctx->data);
+
+    for (i = 0u; i < 4u; i++) {
+        hash[i]       = (uint8_t)(ctx->state[0] >> (24u - i * 8u));
+        hash[i + 4u]  = (uint8_t)(ctx->state[1] >> (24u - i * 8u));
+        hash[i + 8u]  = (uint8_t)(ctx->state[2] >> (24u - i * 8u));
+        hash[i + 12u] = (uint8_t)(ctx->state[3] >> (24u - i * 8u));
+        hash[i + 16u] = (uint8_t)(ctx->state[4] >> (24u - i * 8u));
+        hash[i + 20u] = (uint8_t)(ctx->state[5] >> (24u - i * 8u));
+        hash[i + 24u] = (uint8_t)(ctx->state[6] >> (24u - i * 8u));
+        hash[i + 28u] = (uint8_t)(ctx->state[7] >> (24u - i * 8u));
+    }
+}
+
+/* ---- Write helpers ---- */
+
+static void w_u8(uint8_t *buf, size_t *p, uint8_t v)
+{
+    buf[(*p)++] = v;
+}
+
+static void w_u16le(uint8_t *buf, size_t *p, uint16_t v)
+{
+    buf[(*p)++] = (uint8_t)(v);
+    buf[(*p)++] = (uint8_t)(v >> 8u);
+}
+
+static void w_u32le(uint8_t *buf, size_t *p, uint32_t v)
+{
+    buf[(*p)++] = (uint8_t)(v);
+    buf[(*p)++] = (uint8_t)(v >> 8u);
+    buf[(*p)++] = (uint8_t)(v >> 16u);
+    buf[(*p)++] = (uint8_t)(v >> 24u);
+}
+
+static void w_zero(uint8_t *buf, size_t *p, size_t n)
+{
+    memset(buf + *p, 0, n);
+    *p += n;
+}
+
+/*
+ * Write `length` bytes of segment data starting at byte `byte_offset` within
+ * the padded segment.  Real data occupies [0, seg->filesz); the remainder
+ * (seg->filesz_padded - seg->filesz) is zero-padded.
+ * All written bytes (including zeros) are XOR'd into *chk.
+ */
+static void write_seg_slice(uint8_t *buf, size_t *p, uint8_t *chk,
+                            const uint8_t *elf_data, const img_seg_t *seg,
+                            uint32_t byte_offset, uint32_t length)
+{
+    uint32_t real_avail = (seg->filesz > byte_offset)
+                          ? (seg->filesz - byte_offset) : 0u;
+    uint32_t real_bytes = (real_avail < length) ? real_avail : length;
+    uint32_t zero_bytes = length - real_bytes;
+
+    if (real_bytes > 0u) {
+        const uint8_t *src = elf_data + seg->fileoff + byte_offset;
+        memcpy(buf + *p, src, real_bytes);
+        for (uint32_t k = 0u; k < real_bytes; k++) {
+            *chk ^= src[k];
+        }
+        *p += real_bytes;
+    }
+    if (zero_bytes > 0u) {
+        memset(buf + *p, 0, zero_bytes);
+        /* zeros do not change XOR checksum */
+        *p += zero_bytes;
+    }
+}
+
+/* Write the binary image into out_buf (caller guarantees capacity). */
+static void image_write(const uint8_t *elf_data,
+                        const esp_chip_info_t *ci,
+                        const esp_loader_elf_cfg_t *cfg,
+                        const img_seg_t *segs, size_t n_segs,
+                        size_t header_size, size_t n_written_segs,
+                        uint8_t *out_buf)
+{
+    size_t pos = 0u;
+    uint8_t chk = 0xEFu; /* initial checksum magic */
+
+    const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)elf_data;
+
+    /* ---- Base header (8 bytes) ---- */
+    w_u8(out_buf, &pos, 0xE9u);                               /* magic */
+    w_u8(out_buf, &pos, (uint8_t)n_written_segs);             /* segment count */
+    w_u8(out_buf, &pos, cfg->flash_mode);                     /* flash mode */
+    w_u8(out_buf, &pos,                                        /* flash size | freq */
+         (uint8_t)((cfg->flash_size << 4u) | (cfg->flash_freq & 0x0Fu)));
+    w_u32le(out_buf, &pos, ehdr->e_entry);                    /* entry point */
+
+    /* ---- Extended header (16 bytes for ESP32+) ---- */
+    if (ci->has_ext_header) {
+        w_u8(out_buf, &pos, 0xEEu);                          /* wp_pin = disabled */
+        w_u8(out_buf, &pos, 0x00u);                          /* clk_drv | q_drv */
+        w_u8(out_buf, &pos, 0x00u);                          /* d_drv | cs_drv */
+        w_u8(out_buf, &pos, 0x00u);                          /* reserved */
+        w_u16le(out_buf, &pos, ci->chip_id);                 /* chip_id */
+        w_u8(out_buf, &pos, 0x00u);                          /* min_chip_rev (legacy) */
+        w_u16le(out_buf, &pos, cfg->min_chip_rev_full);
+        w_u16le(out_buf, &pos, cfg->max_chip_rev_full);
+        w_zero(out_buf, &pos, 4u);                           /* reserved */
+        w_u8(out_buf, &pos, cfg->append_sha256 ? 1u : 0u);  /* append_digest */
+    }
+
+    /* ---- Layout pass: mirrors layout_size() exactly ---- */
+    size_t ram_idx = 0u;
+    uint32_t ram_written = 0u; /* bytes of segs[ram_idx] already placed */
+
+    while (ram_idx < n_segs && segs[ram_idx].is_flash) {
+        ram_idx++;
+    }
+
+    for (size_t i = 0u; i < n_segs; i++) {
+        if (!segs[i].is_flash) {
+            continue;
+        }
+
+        uint32_t req_data_mod = segs[i].vaddr % IROM_ALIGN;
+        uint32_t req_desc_mod = (req_data_mod + IROM_ALIGN - SEG_HDR_LEN) % IROM_ALIGN;
+        uint32_t cur_mod = (uint32_t)(pos % IROM_ALIGN);
+        size_t gap = (cur_mod <= req_desc_mod)
+                     ? (req_desc_mod - cur_mod)
+                     : (IROM_ALIGN - cur_mod + req_desc_mod);
+        size_t target = pos + gap;
+
+        /* Fill gap with RAM segment descriptors + data, splitting if needed. */
+        while (gap > 0u && ram_idx < n_segs) {
+            uint32_t remaining = segs[ram_idx].filesz_padded - ram_written;
+            if (gap < SEG_HDR_LEN) {
+                break;
+            }
+            uint32_t avail_data = (uint32_t)(gap - SEG_HDR_LEN);
+
+            if (remaining <= avail_data) {
+                /* Whole segment fits. */
+                w_u32le(out_buf, &pos, segs[ram_idx].vaddr + ram_written);
+                w_u32le(out_buf, &pos, remaining);
+                write_seg_slice(out_buf, &pos, &chk, elf_data,
+                                &segs[ram_idx], ram_written, remaining);
+                gap -= SEG_HDR_LEN + remaining;
+                ram_written = 0u;
+                ram_idx++;
+                while (ram_idx < n_segs && segs[ram_idx].is_flash) {
+                    ram_idx++;
+                }
+            } else {
+                /* Split: place avail_data bytes now, rest goes after flash seg. */
+                w_u32le(out_buf, &pos, segs[ram_idx].vaddr + ram_written);
+                w_u32le(out_buf, &pos, avail_data);
+                write_seg_slice(out_buf, &pos, &chk, elf_data,
+                                &segs[ram_idx], ram_written, avail_data);
+                ram_written += avail_data;
+                gap = 0u;
+            }
+        }
+
+        /* Zero-fill any remaining gap before the flash descriptor. */
+        if (pos < target) {
+            w_zero(out_buf, &pos, target - pos);
+        }
+
+        /* Flash segment descriptor + data. */
+        w_u32le(out_buf, &pos, segs[i].vaddr);
+        w_u32le(out_buf, &pos, segs[i].filesz_padded);
+        write_seg_slice(out_buf, &pos, &chk, elf_data,
+                        &segs[i], 0u, segs[i].filesz_padded);
+    }
+
+    /* Write remaining RAM segments (including split tails). */
+    while (ram_idx < n_segs) {
+        if (!segs[ram_idx].is_flash) {
+            uint32_t remaining = segs[ram_idx].filesz_padded - ram_written;
+            w_u32le(out_buf, &pos, segs[ram_idx].vaddr + ram_written);
+            w_u32le(out_buf, &pos, remaining);
+            write_seg_slice(out_buf, &pos, &chk, elf_data,
+                            &segs[ram_idx], ram_written, remaining);
+            ram_written = 0u;
+        }
+        ram_idx++;
+    }
+
+    /* Checksum padding: (pad-1) zero bytes + checksum byte. */
+    size_t pad = (15u - (pos % 16u)) % 16u + 1u;
+    for (size_t k = 0u; k < pad - 1u; k++) {
+        w_u8(out_buf, &pos, 0x00u);
+    }
+    w_u8(out_buf, &pos, chk);
+
+    /* SHA-256 over all preceding bytes. */
+    if (cfg->append_sha256) {
+        sha256_ctx_t sha_ctx;
+        sha256_init(&sha_ctx);
+        sha256_update(&sha_ctx, out_buf, pos);
+        sha256_final(&sha_ctx, out_buf + pos);
+        pos += SHA256_LEN;
+    }
+
+    (void)pos; /* pos == needed; caller already verified capacity */
+}
+
+/* -------------------------------------------------------------------------
+ * Public API
  * ---------------------------------------------------------------------- */
 
 esp_loader_error_t esp_loader_elf_to_flash_image(
@@ -465,7 +804,9 @@ esp_loader_error_t esp_loader_elf_to_flash_image(
     const esp_chip_info_t *ci = elf_chip_info(chip);
     size_t header_size = ci->has_ext_header ? 24u : 8u;
 
-    size_t needed = layout_size(segs, n_segs, header_size, cfg->append_sha256);
+    size_t n_written_segs = 0u;
+    size_t needed = layout_size(segs, n_segs, header_size, cfg->append_sha256,
+                                &n_written_segs);
 
     if (out_buf == NULL) {
         /* Dry-run: report required size and return. */
@@ -473,13 +814,13 @@ esp_loader_error_t esp_loader_elf_to_flash_image(
         return ESP_LOADER_SUCCESS;
     }
 
-    /* Write pass (Task 4): check capacity. */
+    /* Write pass: check capacity. */
     if (*out_size < needed) {
         return ESP_LOADER_ERROR_IMAGE_SIZE;
     }
 
-    /* Task 4 write pass — not yet implemented. */
-    (void)out_buf;
+    image_write(elf_data, ci, cfg, segs, n_segs, header_size,
+                n_written_segs, out_buf);
     *out_size = needed;
     return ESP_LOADER_SUCCESS;
 }
