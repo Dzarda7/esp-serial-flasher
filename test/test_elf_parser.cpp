@@ -187,3 +187,253 @@ TEST_CASE("elf_get_phdr: NULL data returns NULL", "[elf_parser]")
 {
     CHECK(elf_get_phdr(nullptr, 128, 0) == nullptr);
 }
+
+/* ---------------------------------------------------------------------------
+ * Task 2 — elf_classify_segment and elf_chip_info tests
+ * Spot-checks validated against esptool/targets/<chip>.py and loader.py.
+ * ------------------------------------------------------------------------ */
+
+/* Helper: classify and optionally check the flash-window offset. */
+static esp_seg_type_t classify(target_chip_t chip, uint32_t vaddr,
+                               uint32_t *flash_out = nullptr)
+{
+    return elf_classify_segment(chip, vaddr, flash_out);
+}
+
+/* ---- ESP8266 ---- */
+TEST_CASE("classify ESP8266: IROM (0x40200000)", "[seg_classifier]")
+{
+    uint32_t faddr = 0xDEAD;
+    CHECK(classify(ESP8266_CHIP, 0x40200000u, &faddr) == ESP_SEG_IROM);
+    CHECK(faddr == 0u); /* vaddr - mmu_offset = 0x40200000 - 0x40200000 */
+}
+
+TEST_CASE("classify ESP8266: IROM mid-range (0x40250000)", "[seg_classifier]")
+{
+    uint32_t faddr = 0;
+    CHECK(classify(ESP8266_CHIP, 0x40250000u, &faddr) == ESP_SEG_IROM);
+    CHECK(faddr == 0x50000u);
+}
+
+TEST_CASE("classify ESP8266: DRAM (0x3FFF0000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP8266_CHIP, 0x3FFF0000u) == ESP_SEG_DRAM);
+}
+
+TEST_CASE("classify ESP8266: IRAM (0x40100000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP8266_CHIP, 0x40100000u) == ESP_SEG_IRAM);
+}
+
+TEST_CASE("classify ESP8266: unknown (0x00000000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP8266_CHIP, 0x00000000u) == ESP_SEG_UNKNOWN);
+}
+
+/* flash_addr_out must NOT be written for RAM segments. */
+TEST_CASE("classify ESP8266: DRAM does not write flash_addr_out", "[seg_classifier]")
+{
+    uint32_t sentinel = 0xDEADBEEFu;
+    CHECK(classify(ESP8266_CHIP, 0x3FFF0000u, &sentinel) == ESP_SEG_DRAM);
+    CHECK(sentinel == 0xDEADBEEFu);
+}
+
+/* ---- ESP32 ---- */
+TEST_CASE("classify ESP32: DROM (0x3F500000)", "[seg_classifier]")
+{
+    uint32_t faddr = 0xDEAD;
+    CHECK(classify(ESP32_CHIP, 0x3F500000u, &faddr) == ESP_SEG_DROM);
+    CHECK(faddr == 0x100000u); /* 0x3F500000 - 0x3F400000 */
+}
+
+TEST_CASE("classify ESP32: IROM (0x400E0000)", "[seg_classifier]")
+{
+    uint32_t faddr = 0xDEAD;
+    CHECK(classify(ESP32_CHIP, 0x400E0000u, &faddr) == ESP_SEG_IROM);
+    CHECK(faddr == 0x10000u); /* 0x400E0000 - 0x400D0000 */
+}
+
+TEST_CASE("classify ESP32: DRAM (0x3FFBE000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32_CHIP, 0x3FFBe000u) == ESP_SEG_DRAM);
+}
+
+TEST_CASE("classify ESP32: IRAM (0x40090000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32_CHIP, 0x40090000u) == ESP_SEG_IRAM);
+}
+
+TEST_CASE("classify ESP32: RTC_DATA (0x50000010)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32_CHIP, 0x50000010u) == ESP_SEG_RTC_DATA);
+}
+
+TEST_CASE("classify ESP32: address just below DROM returns UNKNOWN", "[seg_classifier]")
+{
+    CHECK(classify(ESP32_CHIP, 0x3F3FFFFFu) == ESP_SEG_UNKNOWN);
+}
+
+TEST_CASE("classify ESP32: IROM MAP_END is exclusive (0x40400000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32_CHIP, 0x40400000u) == ESP_SEG_UNKNOWN);
+}
+
+/* ---- ESP32-S2 ---- */
+TEST_CASE("classify ESP32-S2: DROM (0x3F100000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32S2_CHIP, 0x3F100000u) == ESP_SEG_DROM);
+}
+
+TEST_CASE("classify ESP32-S2: IROM (0x40100000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32S2_CHIP, 0x40100000u) == ESP_SEG_IROM);
+}
+
+TEST_CASE("classify ESP32-S2: DRAM (0x3FFC0000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32S2_CHIP, 0x3FFC0000u) == ESP_SEG_DRAM);
+}
+
+TEST_CASE("classify ESP32-S2: IRAM (0x40040000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32S2_CHIP, 0x40040000u) == ESP_SEG_IRAM);
+}
+
+/* ---- ESP32-C3 ---- */
+TEST_CASE("classify ESP32-C3: DROM (0x3C400000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32C3_CHIP, 0x3C400000u) == ESP_SEG_DROM);
+}
+
+TEST_CASE("classify ESP32-C3: IROM (0x42400000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32C3_CHIP, 0x42400000u) == ESP_SEG_IROM);
+}
+
+TEST_CASE("classify ESP32-C3: DRAM (0x3FC90000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32C3_CHIP, 0x3FC90000u) == ESP_SEG_DRAM);
+}
+
+TEST_CASE("classify ESP32-C3: IRAM (0x40380000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32C3_CHIP, 0x40380000u) == ESP_SEG_IRAM);
+}
+
+/* ---- ESP32-S3 ---- */
+TEST_CASE("classify ESP32-S3: DROM (0x3C800000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32S3_CHIP, 0x3C800000u) == ESP_SEG_DROM);
+}
+
+TEST_CASE("classify ESP32-S3: IROM (0x42400000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32S3_CHIP, 0x42400000u) == ESP_SEG_IROM);
+}
+
+TEST_CASE("classify ESP32-S3: DRAM (0x3FC90000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32S3_CHIP, 0x3FC90000u) == ESP_SEG_DRAM);
+}
+
+TEST_CASE("classify ESP32-S3: IRAM (0x40380000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32S3_CHIP, 0x40380000u) == ESP_SEG_IRAM);
+}
+
+/* ---- ESP32-C6 ---- */
+TEST_CASE("classify ESP32-C6: IROM (0x42400000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32C6_CHIP, 0x42400000u) == ESP_SEG_IROM);
+}
+
+TEST_CASE("classify ESP32-C6: DROM (0x42900000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32C6_CHIP, 0x42900000u) == ESP_SEG_DROM);
+}
+
+TEST_CASE("classify ESP32-C6: DRAM (0x40840000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32C6_CHIP, 0x40840000u) == ESP_SEG_DRAM);
+}
+
+/* ---- ESP32-H2 (inherits C6 ranges) ---- */
+TEST_CASE("classify ESP32-H2: IROM (0x42400000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32H2_CHIP, 0x42400000u) == ESP_SEG_IROM);
+}
+
+TEST_CASE("classify ESP32-H2: DROM (0x42900000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32H2_CHIP, 0x42900000u) == ESP_SEG_DROM);
+}
+
+/* ---- ESP32-C5 ---- */
+TEST_CASE("classify ESP32-C5: DROM window (0x43000000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32C5_CHIP, 0x43000000u) == ESP_SEG_DROM);
+}
+
+TEST_CASE("classify ESP32-C5: DRAM window (0x40820000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32C5_CHIP, 0x40820000u) == ESP_SEG_DRAM);
+}
+
+/* ---- ESP32-P4 ---- */
+TEST_CASE("classify ESP32-P4: DROM window (0x44000000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32P4_CHIP, 0x44000000u) == ESP_SEG_DROM);
+}
+
+TEST_CASE("classify ESP32-P4: DRAM (0x4FF10000)", "[seg_classifier]")
+{
+    CHECK(classify(ESP32P4_CHIP, 0x4FF10000u) == ESP_SEG_DRAM);
+}
+
+/* ---- Generic boundary / edge cases ---- */
+TEST_CASE("classify: out-of-range chip returns UNKNOWN", "[seg_classifier]")
+{
+    CHECK(classify(ESP_MAX_CHIP, 0x42000000u) == ESP_SEG_UNKNOWN);
+    CHECK(classify((target_chip_t)99, 0x42000000u) == ESP_SEG_UNKNOWN);
+}
+
+TEST_CASE("classify: NULL flash_addr_out is safe for flash segments", "[seg_classifier]")
+{
+    /* Must not crash when flash_addr_out is NULL. */
+    CHECK(classify(ESP32_CHIP, 0x3F500000u, nullptr) == ESP_SEG_DROM);
+    CHECK(classify(ESP32_CHIP, 0x400E0000u, nullptr) == ESP_SEG_IROM);
+}
+
+/* ---- elf_chip_info ---- */
+TEST_CASE("elf_chip_info: ESP8266 has no extended header", "[seg_classifier]")
+{
+    const esp_chip_info_t *info = elf_chip_info(ESP8266_CHIP);
+    REQUIRE(info != nullptr);
+    CHECK(info->has_ext_header == false);
+}
+
+TEST_CASE("elf_chip_info: ESP32 chip_id == 0x0000, has ext header", "[seg_classifier]")
+{
+    const esp_chip_info_t *info = elf_chip_info(ESP32_CHIP);
+    REQUIRE(info != nullptr);
+    CHECK(info->chip_id == 0x0000u);
+    CHECK(info->has_ext_header == true);
+}
+
+TEST_CASE("elf_chip_info: chip_ids match esptool IMAGE_CHIP_ID", "[seg_classifier]")
+{
+    /* Spot-check a selection; full table validated above. */
+    CHECK(elf_chip_info(ESP32S2_CHIP)->chip_id == 0x0002u);
+    CHECK(elf_chip_info(ESP32C3_CHIP)->chip_id == 0x0005u);
+    CHECK(elf_chip_info(ESP32S3_CHIP)->chip_id == 0x0009u);
+    CHECK(elf_chip_info(ESP32C2_CHIP)->chip_id == 0x000Cu);
+    CHECK(elf_chip_info(ESP32C6_CHIP)->chip_id == 0x000Du);
+    CHECK(elf_chip_info(ESP32H2_CHIP)->chip_id == 0x0010u);
+    CHECK(elf_chip_info(ESP32C5_CHIP)->chip_id == 0x0017u);
+    CHECK(elf_chip_info(ESP32P4_CHIP)->chip_id == 0x0012u);
+}
+
+TEST_CASE("elf_chip_info: out-of-range chip returns NULL", "[seg_classifier]")
+{
+    CHECK(elf_chip_info(ESP_MAX_CHIP) == nullptr);
+}

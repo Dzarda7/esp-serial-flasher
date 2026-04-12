@@ -61,6 +61,74 @@ esp_loader_error_t elf_validate(const uint8_t *data, size_t size);
  */
 const Elf32_Phdr *elf_get_phdr(const uint8_t *data, size_t size, uint16_t index);
 
+/* -------------------------------------------------------------------------
+ * Task 2 — Segment classifier
+ * ---------------------------------------------------------------------- */
+
+#include "esp_loader.h"  /* target_chip_t */
+#include <stdbool.h>
+
+/**
+ * @brief Memory-region types used during ELF→image conversion.
+ */
+typedef enum {
+    ESP_SEG_DROM,      /*!< Flash-mapped read-only data (MMU-cached) */
+    ESP_SEG_IROM,      /*!< Flash-mapped code (MMU-cached) */
+    ESP_SEG_DRAM,      /*!< Data RAM — goes into image with segment header */
+    ESP_SEG_IRAM,      /*!< Instruction RAM — goes into image with segment header */
+    ESP_SEG_RTC_DATA,  /*!< RTC slow/fast memory — goes into image with segment header */
+    ESP_SEG_UNKNOWN,   /*!< Not mapped / not classifiable */
+} esp_seg_type_t;
+
+/**
+ * @brief One contiguous virtual-address range belonging to a memory type.
+ *
+ * @c vaddr_end is an exclusive upper bound (addr < vaddr_end), matching
+ * esptool's MAP_START/MAP_END convention.
+ *
+ * For DROM/IROM segments: flash_addr = vaddr - mmu_offset gives the byte
+ * offset from the start of the flash-mapped window.  Set to 0 for RAM types.
+ */
+typedef struct {
+    uint32_t       vaddr_lo;   /*!< First virtual address in the range (inclusive) */
+    uint32_t       vaddr_end;  /*!< One past the last virtual address (exclusive)  */
+    esp_seg_type_t type;
+    uint32_t       mmu_offset; /*!< Subtract from vaddr to get flash-window offset; 0 for RAM */
+} esp_seg_range_t;
+
+/**
+ * @brief Per-chip metadata needed for the binary image header.
+ */
+typedef struct {
+    uint16_t chip_id;         /*!< IMAGE_CHIP_ID (0xFFFF = ESP8266, no extended header) */
+    bool     has_ext_header;  /*!< true for ESP32 and later (32-byte header) */
+} esp_chip_info_t;
+
+/**
+ * @brief Classify a virtual address for the given chip.
+ *
+ * Looks up @p vaddr in the chip's address range table and returns the
+ * segment type.  If @p flash_addr_out is non-NULL and the result is
+ * @c ESP_SEG_DROM or @c ESP_SEG_IROM, the flash-window offset
+ * (vaddr − mmu_offset) is written into @p *flash_addr_out.
+ *
+ * @param chip           Target chip identifier.
+ * @param vaddr          Virtual address to classify.
+ * @param flash_addr_out Optional output for the flash-window offset.
+ *
+ * @return The @c esp_seg_type_t for @p vaddr, or @c ESP_SEG_UNKNOWN.
+ */
+esp_seg_type_t elf_classify_segment(target_chip_t chip, uint32_t vaddr,
+                                    uint32_t *flash_addr_out);
+
+/**
+ * @brief Return image-header metadata for the given chip.
+ *
+ * @param chip  Target chip identifier (must be < ESP_MAX_CHIP).
+ * @return Pointer to the chip's @c esp_chip_info_t.
+ */
+const esp_chip_info_t *elf_chip_info(target_chip_t chip);
+
 #ifdef __cplusplus
 }
 #endif
