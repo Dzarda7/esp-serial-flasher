@@ -8,6 +8,7 @@ set(srcs
     src/esp_stubs.c
     src/esp_sdio_stubs.c
     src/esp_elf_image.c
+    src/sha256.c
     src/protocol_serial.c
     src/protocol_uart.c
     src/protocol_spi.c

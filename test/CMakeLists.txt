@@ -34,6 +34,7 @@ add_executable(test_elf_parser
 	test_elf_parser.cpp
 	test_tcp_port.cpp
 	../src/esp_elf_image.c
+	../src/sha256.c
 	../src/esp_loader.c
 	../src/esp_targets.c
 	../src/esp_stubs.c
