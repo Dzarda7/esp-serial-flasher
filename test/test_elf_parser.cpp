@@ -22,10 +22,13 @@
 #include <cstring>
 #include <cstdint>
 #include <vector>
+#include <fstream>
+#include <iterator>
 
 extern "C" {
 #include "elf32.h"
 #include "esp_loader_error.h"
+#include "esp_loader_elf.h"
 #include "esp_elf_image_priv.h"
 }
 
@@ -53,10 +56,15 @@ static void fill_elf_header(Elf32_Ehdr *ehdr, uint16_t phnum = 0)
     ehdr->e_phoff            = (phnum > 0) ? sizeof(Elf32_Ehdr) : 0;
 }
 
-/* Build a self-consistent ELF image with `phnum` PT_LOAD segments. */
+/* Build a self-consistent ELF image with `phnum` PT_LOAD segments.
+ * Each segment has 256 bytes of data placed after the program header table
+ * so that bounds checks in collect_segs pass correctly. */
 static std::vector<uint8_t> make_elf(uint16_t phnum = 0)
 {
-    size_t total = sizeof(Elf32_Ehdr) + phnum * sizeof(Elf32_Phdr);
+    const size_t DATA_PER_SEG = 256;
+    size_t phdr_table_size = phnum * sizeof(Elf32_Phdr);
+    size_t data_base       = sizeof(Elf32_Ehdr) + phdr_table_size;
+    size_t total           = data_base + phnum * DATA_PER_SEG;
     std::vector<uint8_t> buf(total, 0);
 
     Elf32_Ehdr *ehdr = reinterpret_cast<Elf32_Ehdr *>(buf.data());
@@ -68,10 +76,10 @@ static std::vector<uint8_t> make_elf(uint16_t phnum = 0)
                                buf.data() + sizeof(Elf32_Ehdr) + i * sizeof(Elf32_Phdr));
         phdr->p_type   = PT_LOAD;
         phdr->p_vaddr  = 0x40080000u + i * 0x1000u;
-        phdr->p_filesz = 256;
-        phdr->p_memsz  = 256;
+        phdr->p_filesz = DATA_PER_SEG;
+        phdr->p_memsz  = DATA_PER_SEG;
         phdr->p_flags  = PF_R | PF_X;
-        phdr->p_offset = 0; /* points inside the header area — valid for bounds check */
+        phdr->p_offset = static_cast<uint32_t>(data_base + i * DATA_PER_SEG);
     }
 
     return buf;
@@ -436,4 +444,184 @@ TEST_CASE("elf_chip_info: chip_ids match esptool IMAGE_CHIP_ID", "[seg_classifie
 TEST_CASE("elf_chip_info: out-of-range chip returns NULL", "[seg_classifier]")
 {
     CHECK(elf_chip_info(ESP_MAX_CHIP) == nullptr);
+}
+
+/* ---------------------------------------------------------------------------
+ * Task 3 — Image size calculator (dry-run pass)
+ * ------------------------------------------------------------------------ */
+
+/* Helper: load a file into a vector. Returns empty vector on failure. */
+static std::vector<uint8_t> load_file(const char *path)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        return {};
+    }
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(f), {});
+}
+
+/* Helper: call dry-run and return the reported size (or 0 on error). */
+static size_t dry_run_size(const std::vector<uint8_t> &elf,
+                           target_chip_t chip,
+                           bool append_sha = false)
+{
+    esp_loader_elf_cfg_t cfg = ESP_LOADER_ELF_CFG_DEFAULT();
+    cfg.append_sha256 = append_sha;
+    size_t sz = 0;
+    esp_loader_error_t err = esp_loader_elf_to_flash_image(
+                                 elf.data(), elf.size(), chip, &cfg, nullptr, &sz);
+    if (err != ESP_LOADER_SUCCESS) {
+        return 0;
+    }
+    return sz;
+}
+
+/* ---- Parameter validation ---- */
+TEST_CASE("size_calc: NULL elf_data returns INVALID_PARAM", "[size_calc]")
+{
+    esp_loader_elf_cfg_t cfg = ESP_LOADER_ELF_CFG_DEFAULT();
+    size_t sz = 0;
+    CHECK(esp_loader_elf_to_flash_image(nullptr, 64, ESP32_CHIP, &cfg, nullptr, &sz)
+          == ESP_LOADER_ERROR_INVALID_PARAM);
+}
+
+TEST_CASE("size_calc: NULL cfg returns INVALID_PARAM", "[size_calc]")
+{
+    auto buf = make_elf(0);
+    size_t sz = 0;
+    CHECK(esp_loader_elf_to_flash_image(buf.data(), buf.size(),
+                                        ESP32_CHIP, nullptr, nullptr, &sz)
+          == ESP_LOADER_ERROR_INVALID_PARAM);
+}
+
+TEST_CASE("size_calc: NULL out_size returns INVALID_PARAM", "[size_calc]")
+{
+    esp_loader_elf_cfg_t cfg = ESP_LOADER_ELF_CFG_DEFAULT();
+    auto buf = make_elf(0);
+    CHECK(esp_loader_elf_to_flash_image(buf.data(), buf.size(),
+                                        ESP32_CHIP, &cfg, nullptr, nullptr)
+          == ESP_LOADER_ERROR_INVALID_PARAM);
+}
+
+TEST_CASE("size_calc: unsupported chip returns UNSUPPORTED_CHIP", "[size_calc]")
+{
+    esp_loader_elf_cfg_t cfg = ESP_LOADER_ELF_CFG_DEFAULT();
+    auto buf = make_elf(0);
+    size_t sz = 0;
+    CHECK(esp_loader_elf_to_flash_image(buf.data(), buf.size(),
+                                        ESP_MAX_CHIP, &cfg, nullptr, &sz)
+          == ESP_LOADER_ERROR_UNSUPPORTED_CHIP);
+}
+
+TEST_CASE("size_calc: malformed ELF returns INVALID_PARAM", "[size_calc]")
+{
+    esp_loader_elf_cfg_t cfg = ESP_LOADER_ELF_CFG_DEFAULT();
+    uint8_t bad[4] = {0};
+    size_t sz = 0;
+    CHECK(esp_loader_elf_to_flash_image(bad, sizeof(bad), ESP32_CHIP, &cfg, nullptr, &sz)
+          == ESP_LOADER_ERROR_INVALID_PARAM);
+}
+
+/* ---- Determinism ---- */
+TEST_CASE("size_calc: two calls with the same ELF return the same size", "[size_calc]")
+{
+    auto buf = make_elf(2);
+    size_t sz1 = dry_run_size(buf, ESP32_CHIP);
+    size_t sz2 = dry_run_size(buf, ESP32_CHIP);
+    CHECK(sz1 == sz2);
+    CHECK(sz1 > 0);
+}
+
+/* ---- Size formula for a synthetic ESP32 ELF (all-RAM, no flash segs) ----
+ *
+ * make_elf(N) produces an ELF whose N PT_LOAD segments all have vaddr in the
+ * IRAM range (0x40080000+), so they are classified as IRAM (RAM segments).
+ * No alignment gaps are inserted.
+ *
+ * Expected size (no SHA, no flash segs):
+ *   header_size  = 24
+ *   segs_size    = N × (8 + 256)   (filesz_padded = 256 for each)
+ *   total_before = 24 + N×264
+ *   pad          = (15 - (total_before % 16)) % 16 + 1
+ *   total        = total_before + pad
+ */
+static size_t expected_all_ram_size(size_t n_segs)
+{
+    const size_t HDR  = 24;
+    const size_t SEGD = 8 + 256; /* descriptor + 256-byte data (already 4-byte aligned) */
+    size_t before = HDR + n_segs * SEGD;
+    size_t pad    = (15u - (before % 16u)) % 16u + 1u;
+    return before + pad;
+}
+
+TEST_CASE("size_calc: synthetic 0-segment ESP32 ELF", "[size_calc]")
+{
+    auto buf = make_elf(0);
+    size_t got = dry_run_size(buf, ESP32_CHIP);
+    CHECK(got == expected_all_ram_size(0));
+}
+
+TEST_CASE("size_calc: synthetic 1-segment ESP32 ELF", "[size_calc]")
+{
+    auto buf = make_elf(1);
+    size_t got = dry_run_size(buf, ESP32_CHIP);
+    CHECK(got == expected_all_ram_size(1));
+}
+
+TEST_CASE("size_calc: synthetic 3-segment ESP32 ELF", "[size_calc]")
+{
+    auto buf = make_elf(3);
+    size_t got = dry_run_size(buf, ESP32_CHIP);
+    CHECK(got == expected_all_ram_size(3));
+}
+
+/* ---- SHA-256 adds exactly 32 bytes ---- */
+TEST_CASE("size_calc: append_sha256 adds exactly 32 bytes", "[size_calc]")
+{
+    auto buf = make_elf(2);
+    size_t without = dry_run_size(buf, ESP32_CHIP, false);
+    size_t with    = dry_run_size(buf, ESP32_CHIP, true);
+    CHECK(with == without + 32);
+}
+
+/* ---- Truncated ELF returns INVALID_PARAM ---- */
+TEST_CASE("size_calc: ELF truncated by 1 byte returns INVALID_PARAM", "[size_calc]")
+{
+    auto buf = make_elf(0);
+    buf.resize(buf.size() - 1);
+    esp_loader_elf_cfg_t cfg = ESP_LOADER_ELF_CFG_DEFAULT();
+    size_t sz = 0;
+    CHECK(esp_loader_elf_to_flash_image(buf.data(), buf.size(),
+                                        ESP32_CHIP, &cfg, nullptr, &sz)
+          == ESP_LOADER_ERROR_INVALID_PARAM);
+}
+
+/* ---- Real IDF ELF: hello_world (ESP32 / Xtensa) ---- *
+ * Validated against: esptool --chip esp32 elf2image --dont-append-digest
+ * Expected sizes: 122480 bytes (no SHA), 122512 bytes (with SHA).
+ */
+static const char HELLO_WORLD_ELF[] =
+    "/home/jarda/esp/master/esp-idf/examples/get-started"
+    "/hello_world/build/hello_world.elf";
+static const size_t HELLO_WORLD_BIN_NOSHA = 122480;
+static const size_t HELLO_WORLD_BIN_SHA   = 122512;
+
+TEST_CASE("size_calc: hello_world.elf size matches esptool (no SHA)", "[size_calc][real_elf]")
+{
+    auto elf = load_file(HELLO_WORLD_ELF);
+    if (elf.empty()) {
+        WARN("Skipped: " << HELLO_WORLD_ELF << " not found");
+        return;
+    }
+    CHECK(dry_run_size(elf, ESP32_CHIP, false) == HELLO_WORLD_BIN_NOSHA);
+}
+
+TEST_CASE("size_calc: hello_world.elf size matches esptool (with SHA)", "[size_calc][real_elf]")
+{
+    auto elf = load_file(HELLO_WORLD_ELF);
+    if (elf.empty()) {
+        WARN("Skipped: " << HELLO_WORLD_ELF << " not found");
+        return;
+    }
+    CHECK(dry_run_size(elf, ESP32_CHIP, true) == HELLO_WORLD_BIN_SHA);
 }

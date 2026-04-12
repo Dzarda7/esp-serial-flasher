@@ -16,10 +16,12 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 
 #include "elf32.h"
 #include "esp_loader.h"
 #include "esp_loader_error.h"
+#include "esp_loader_elf.h"
 #include "esp_elf_image_priv.h"
 
 /* -------------------------------------------------------------------------
@@ -269,4 +271,215 @@ const esp_chip_info_t *elf_chip_info(target_chip_t chip)
         return NULL;
     }
     return &s_chip_table[chip].info;
+}
+
+/* -------------------------------------------------------------------------
+ * Task 3 — Image size calculator (dry-run pass)
+ *
+ * Binary format (cross-validated against esptool v5.2 output):
+ *
+ *   [header: 24 B for ESP32+, 8 B for ESP8266]
+ *   [seg descriptor (8 B) + data (padded to 4 B)] × seg_count
+ *   [checksum padding: (15 - pos%16)%16+1 raw bytes, last byte = XOR checksum]
+ *   [SHA-256 digest: 32 B, when cfg->append_sha256]
+ *
+ * Flash-mapped segments (DROM/IROM) are placed so that:
+ *   file_pos_of_data % IROM_ALIGN == vaddr % IROM_ALIGN
+ * RAM segments fill the gaps between flash segments and may be split.
+ * ---------------------------------------------------------------------- */
+
+#define MAX_SEGS    16u
+#define IROM_ALIGN  0x10000u  /* 64 KB — same as esptool ESP32FirmwareImage.IROM_ALIGN */
+#define SEG_HDR_LEN 8u        /* 4-byte load_addr + 4-byte data_size */
+#define SHA256_LEN  32u
+
+/* Round n up to the nearest 4-byte boundary (segment data padding). */
+static uint32_t round_up4(uint32_t n)
+{
+    return (n + 3u) & ~3u;
+}
+
+/* Internal segment descriptor collected from PT_LOAD headers. */
+typedef struct {
+    uint32_t vaddr;         /* virtual address */
+    uint32_t filesz_padded; /* p_filesz rounded up to 4 bytes */
+    uint32_t fileoff;       /* byte offset of segment data in the ELF */
+    bool     is_flash;      /* true → DROM or IROM (flash-mapped) */
+} img_seg_t;
+
+/* Collect all PT_LOAD segments with p_filesz > 0 into segs[]. */
+static esp_loader_error_t collect_segs(const uint8_t *data, size_t size,
+                                       target_chip_t chip,
+                                       img_seg_t *segs, size_t *n_out)
+{
+    const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)data;
+    size_t n = 0;
+
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        const Elf32_Phdr *ph = elf_get_phdr(data, size, i);
+        if (ph == NULL || ph->p_type != PT_LOAD || ph->p_filesz == 0) {
+            continue;
+        }
+        /* Segment data must lie within the ELF buffer. */
+        if ((uint64_t)ph->p_offset + ph->p_filesz > size) {
+            return ESP_LOADER_ERROR_INVALID_PARAM;
+        }
+        if (n >= MAX_SEGS) {
+            return ESP_LOADER_ERROR_INVALID_PARAM;
+        }
+        esp_seg_type_t t = elf_classify_segment(chip, ph->p_vaddr, NULL);
+        segs[n].vaddr = ph->p_vaddr;
+        segs[n].filesz_padded = round_up4(ph->p_filesz);
+        segs[n].fileoff = ph->p_offset;
+        segs[n].is_flash = (t == ESP_SEG_DROM || t == ESP_SEG_IROM);
+        n++;
+    }
+    *n_out = n;
+    return ESP_LOADER_SUCCESS;
+}
+
+/*
+ * Simulate the image layout and return the total byte count.
+ *
+ * Flash segments are placed at IROM_ALIGN-aligned file positions matching
+ * their vaddr (same algorithm as esptool ESP32FirmwareImage.save()).
+ * RAM segments fill the gaps, split across descriptors as needed.
+ */
+static size_t layout_size(const img_seg_t *segs, size_t n,
+                          size_t header_size, bool append_sha256)
+{
+    size_t pos = header_size;
+
+    /* RAM cursor: tracks which RAM segment we are currently consuming
+     * and how many bytes of its (padded) data have already been placed. */
+    size_t ram_idx = 0;
+    uint32_t ram_used = 0; /* bytes of segs[ram_idx].filesz_padded consumed */
+
+    /* Advance ram_idx past any leading flash segments. */
+    while (ram_idx < n && segs[ram_idx].is_flash) {
+        ram_idx++;
+    }
+
+    /* Process flash segments in ELF order. */
+    for (size_t i = 0; i < n; i++) {
+        if (!segs[i].is_flash) {
+            continue;
+        }
+
+        /*
+         * Compute the target descriptor position for this flash segment:
+         *   data must satisfy: data_pos % IROM_ALIGN == vaddr % IROM_ALIGN
+         *   descriptor is SEG_HDR_LEN bytes before data.
+         */
+        uint32_t req_data_mod = segs[i].vaddr % IROM_ALIGN;
+        uint32_t req_desc_mod = (req_data_mod + IROM_ALIGN - SEG_HDR_LEN) % IROM_ALIGN;
+
+        uint32_t cur_mod = (uint32_t)(pos % IROM_ALIGN);
+        size_t gap;
+        if (cur_mod <= req_desc_mod) {
+            gap = req_desc_mod - cur_mod;
+        } else {
+            gap = IROM_ALIGN - cur_mod + req_desc_mod;
+        }
+        size_t target = pos + gap;
+
+        /* Fill the gap with RAM segment descriptors + data, splitting if needed. */
+        while (gap > 0 && ram_idx < n) {
+            uint32_t remaining = segs[ram_idx].filesz_padded - ram_used;
+
+            if (gap < SEG_HDR_LEN) {
+                /* Can't fit a descriptor — gap too small; stop filling. */
+                break;
+            }
+            uint32_t avail_data = (uint32_t)(gap - SEG_HDR_LEN);
+
+            if (remaining <= avail_data) {
+                /* Whole segment fits in the gap. */
+                pos += SEG_HDR_LEN + remaining;
+                gap -= SEG_HDR_LEN + remaining;
+                ram_used = 0;
+                ram_idx++;
+                /* Skip any embedded flash segments in the sequence. */
+                while (ram_idx < n && segs[ram_idx].is_flash) {
+                    ram_idx++;
+                }
+            } else {
+                /* Split: write avail_data bytes, leave the rest for after IROM. */
+                pos += SEG_HDR_LEN + avail_data;
+                ram_used += avail_data;
+                gap = 0;
+            }
+        }
+
+        /* Place flash segment. */
+        pos = target;
+        pos += SEG_HDR_LEN + segs[i].filesz_padded;
+    }
+
+    /* Write remaining RAM segments (or the tail of a split one). */
+    while (ram_idx < n) {
+        if (!segs[ram_idx].is_flash) {
+            uint32_t remaining = segs[ram_idx].filesz_padded - ram_used;
+            pos += SEG_HDR_LEN + remaining;
+            ram_used = 0;
+        }
+        ram_idx++;
+    }
+
+    /* Checksum padding: (15 - pos%16)%16 + 1 bytes (last byte = XOR checksum). */
+    pos += (15u - (pos % 16u)) % 16u + 1u;
+
+    /* Optional SHA-256 digest. */
+    if (append_sha256) {
+        pos += SHA256_LEN;
+    }
+
+    return pos;
+}
+
+/* -------------------------------------------------------------------------
+ * Public API — Task 3: dry-run (out_buf == NULL)
+ * ---------------------------------------------------------------------- */
+
+esp_loader_error_t esp_loader_elf_to_flash_image(
+    const uint8_t              *elf_data,
+    size_t                      elf_size,
+    target_chip_t               chip,
+    const esp_loader_elf_cfg_t *cfg,
+    uint8_t                    *out_buf,
+    size_t                     *out_size)
+{
+    if (elf_data == NULL || cfg == NULL || out_size == NULL) {
+        return ESP_LOADER_ERROR_INVALID_PARAM;
+    }
+    if ((unsigned)chip >= ESP_MAX_CHIP) {
+        return ESP_LOADER_ERROR_UNSUPPORTED_CHIP;
+    }
+
+    RETURN_ON_ERROR(elf_validate(elf_data, elf_size));
+
+    img_seg_t segs[MAX_SEGS];
+    size_t n_segs = 0;
+    RETURN_ON_ERROR(collect_segs(elf_data, elf_size, chip, segs, &n_segs));
+
+    const esp_chip_info_t *ci = elf_chip_info(chip);
+    size_t header_size = ci->has_ext_header ? 24u : 8u;
+
+    size_t needed = layout_size(segs, n_segs, header_size, cfg->append_sha256);
+
+    if (out_buf == NULL) {
+        /* Dry-run: report required size and return. */
+        *out_size = needed;
+        return ESP_LOADER_SUCCESS;
+    }
+
+    /* Write pass (Task 4): check capacity. */
+    if (*out_size < needed) {
+        return ESP_LOADER_ERROR_IMAGE_SIZE;
+    }
+
+    /* Task 4 write pass — not yet implemented. */
+    (void)out_buf;
+    *out_size = needed;
+    return ESP_LOADER_SUCCESS;
 }
