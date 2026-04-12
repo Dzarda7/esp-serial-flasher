@@ -86,6 +86,29 @@ esp_loader_error_t esp_loader_elf_to_flash_image(
     uint8_t                    *out_buf,
     size_t                     *out_size);
 
+/**
+ * @brief Load an ELF executable into the target's RAM and execute it.
+ *
+ * Iterates all PT_LOAD segments with non-zero file size and writes each to
+ * its p_vaddr via esp_loader_mem_start / esp_loader_mem_write.  After all
+ * segments are transferred, calls esp_loader_mem_finish with the ELF entry
+ * point so the target begins execution immediately.
+ *
+ * No image header is constructed and no scratch buffer is required.
+ *
+ * @param loader    Loader context returned by esp_loader_connect().
+ * @param elf_data  Pointer to the ELF image in memory.
+ * @param elf_size  Size of the ELF image in bytes.
+ *
+ * @return ESP_LOADER_SUCCESS on success.
+ * @return ESP_LOADER_ERROR_INVALID_PARAM if the ELF is malformed or NULL.
+ * @return Any error returned by esp_loader_mem_start / write / finish.
+ */
+esp_loader_error_t esp_loader_load_elf_to_ram(
+    esp_loader_t  *loader,
+    const uint8_t *elf_data,
+    size_t         elf_size);
+
 #ifdef __cplusplus
 }
 #endif

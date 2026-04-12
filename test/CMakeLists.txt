@@ -32,8 +32,23 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 # ---------------------------------------------------------------------------
 add_executable(test_elf_parser
 	test_elf_parser.cpp
-	../src/esp_elf_image.c)
+	test_tcp_port.cpp
+	../src/esp_elf_image.c
+	../src/esp_loader.c
+	../src/esp_targets.c
+	../src/esp_stubs.c
+	../src/esp_sdio_stubs.c
+	../src/md5_hash.c
+	../src/protocol_serial.c
+	../src/protocol_uart.c
+	../src/protocol_spi.c
+	../src/protocol_sdio.c
+	../src/slip.c)
 
 target_include_directories(test_elf_parser PRIVATE ../include ../private_include ../test)
 target_compile_options(test_elf_parser PRIVATE -Wall -Werror -O2)
 set_property(TARGET test_elf_parser PROPERTY CXX_STANDARD 14)
+target_compile_definitions(test_elf_parser PRIVATE
+	SERIAL_FLASHER_DEBUG_TRACE
+	SERIAL_FLASHER_WRITE_BLOCK_RETRIES=3
+)

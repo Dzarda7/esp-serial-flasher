@@ -824,3 +824,50 @@ esp_loader_error_t esp_loader_elf_to_flash_image(
     *out_size = needed;
     return ESP_LOADER_SUCCESS;
 }
+
+/* -------------------------------------------------------------------------
+ * Task 6 — RAM ELF loader
+ * ---------------------------------------------------------------------- */
+
+#define ESP_RAM_BLOCK 0x1800u
+
+esp_loader_error_t esp_loader_load_elf_to_ram(
+    esp_loader_t  *loader,
+    const uint8_t *elf_data,
+    size_t         elf_size)
+{
+    RETURN_ON_ERROR(elf_validate(elf_data, elf_size));
+
+    const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)elf_data;
+
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        const Elf32_Phdr *phdr = elf_get_phdr(elf_data, elf_size, i);
+        if (phdr == NULL || phdr->p_type != PT_LOAD || phdr->p_filesz == 0) {
+            continue;
+        }
+
+        /* Bounds-check segment data against the ELF buffer. */
+        if ((uint64_t)phdr->p_offset + phdr->p_filesz > elf_size) {
+            return ESP_LOADER_ERROR_INVALID_PARAM;
+        }
+
+        esp_loader_mem_cfg_t mem_cfg = {
+            .offset     = phdr->p_vaddr,
+            .size       = phdr->p_filesz,
+            .block_size = ESP_RAM_BLOCK,
+        };
+        RETURN_ON_ERROR(esp_loader_mem_start(loader, &mem_cfg));
+
+        const uint8_t *data   = elf_data + phdr->p_offset;
+        size_t         remain = phdr->p_filesz;
+        while (remain > 0) {
+            uint32_t chunk = (remain < ESP_RAM_BLOCK) ? (uint32_t)remain : ESP_RAM_BLOCK;
+            RETURN_ON_ERROR(esp_loader_mem_write(loader, &mem_cfg, data, chunk));
+            data   += chunk;
+            remain -= chunk;
+        }
+    }
+
+    esp_loader_mem_cfg_t dummy = {0};
+    return esp_loader_mem_finish(loader, &dummy, ehdr->e_entry);
+}
