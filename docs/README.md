@@ -7,6 +7,7 @@
 | [Configuration](configuration.md)                      | Build options, CMake variables, and feature configuration                   |
 | [Supporting New Platforms](supporting-new-platform.md) | Guide for adding support for new host platforms                             |
 | [Migration Guide v1 → v2](migration-v1-to-v2.md)       | Breaking changes and step-by-step upgrade instructions                      |
+| [Tests](../test/README.md)                             | Host unit tests, QEMU tests, and target tests                               |
 
 ## 🔗 Related Resources
 
