@@ -516,10 +516,117 @@ static void write_seg_slice(uint8_t *buf, size_t *p, uint8_t *chk,
     }
 }
 
+/* -------------------------------------------------------------------------
+ * Chip-specific flash parameter encoding
+ *
+ * These functions translate chip-agnostic enum values into the nibble
+ * values written into the image header.  The encodings mirror the
+ * esptool FLASH_FREQUENCY / FLASH_SIZES ROM-class tables.
+ * Returns -1 when the frequency or size is not supported by the chip.
+ * ---------------------------------------------------------------------- */
+
+static int8_t encode_flash_freq(target_chip_t chip, esp_flash_freq_t freq)
+{
+    typedef struct {
+        esp_flash_freq_t freq;
+        int8_t nibble;
+    } entry_t;
+
+    /* ESP8266, ESP32, ESP32-S2, ESP32-S3, ESP32-P4 */
+    static const entry_t common[] = {
+        {ESP_FLASH_FREQ_80M, 0xF}, {ESP_FLASH_FREQ_40M, 0x0},
+        {ESP_FLASH_FREQ_26M, 0x1}, {ESP_FLASH_FREQ_20M, 0x2},
+        {ESP_FLASH_FREQ_KEEP, 0xF}, {-1, -1},
+    };
+    /* ESP32-C2: 60m/30m/20m/15m */
+    static const entry_t c2[] = {
+        {ESP_FLASH_FREQ_60M, 0xF}, {ESP_FLASH_FREQ_30M, 0x0},
+        {ESP_FLASH_FREQ_20M, 0x1}, {ESP_FLASH_FREQ_15M, 0x2},
+        {ESP_FLASH_FREQ_KEEP, 0xF}, {-1, -1},
+    };
+    /* ESP32-C3, ESP32-C5: 80m/40m/20m */
+    static const entry_t c3[] = {
+        {ESP_FLASH_FREQ_80M, 0xF}, {ESP_FLASH_FREQ_40M, 0x0},
+        {ESP_FLASH_FREQ_20M, 0x2}, {ESP_FLASH_FREQ_KEEP, 0xF}, {-1, -1},
+    };
+    /* ESP32-C6: 80m and 40m both map to 0x0 */
+    static const entry_t c6[] = {
+        {ESP_FLASH_FREQ_80M, 0x0}, {ESP_FLASH_FREQ_40M, 0x0},
+        {ESP_FLASH_FREQ_20M, 0x2}, {ESP_FLASH_FREQ_KEEP, 0x0}, {-1, -1},
+    };
+    /* ESP32-H2: 48m/24m/16m/12m */
+    static const entry_t h2[] = {
+        {ESP_FLASH_FREQ_48M, 0xF}, {ESP_FLASH_FREQ_24M, 0x0},
+        {ESP_FLASH_FREQ_16M, 0x1}, {ESP_FLASH_FREQ_12M, 0x2},
+        {ESP_FLASH_FREQ_KEEP, 0xF}, {-1, -1},
+    };
+
+    const entry_t *tbl;
+    switch (chip) {
+    case ESP32C2_CHIP: tbl = c2;     break;
+    case ESP32C3_CHIP: tbl = c3;     break;
+    case ESP32C5_CHIP: tbl = c3;     break;
+    case ESP32C6_CHIP: tbl = c6;     break;
+    case ESP32H2_CHIP: tbl = h2;     break;
+    default:           tbl = common; break;
+    }
+
+    for (int i = 0; tbl[i].nibble != -1; i++) {
+        if (tbl[i].freq == freq) {
+            return tbl[i].nibble;
+        }
+    }
+    return -1;
+}
+
+static int8_t encode_flash_size(target_chip_t chip, esp_flash_size_t size)
+{
+    typedef struct {
+        esp_flash_size_t size;
+        int8_t nibble;
+    } entry_t;
+
+    if (size == ESP_FLASH_SIZE_DETECT) {
+        return (int8_t)0xF;
+    }
+
+    if (chip == ESP8266_CHIP) {
+        static const entry_t tbl[] = {
+            {ESP_FLASH_SIZE_512KB, 0x0}, {ESP_FLASH_SIZE_256KB, 0x1},
+            {ESP_FLASH_SIZE_1MB,   0x2}, {ESP_FLASH_SIZE_2MB,   0x3},
+            {ESP_FLASH_SIZE_4MB,   0x4}, {ESP_FLASH_SIZE_8MB,   0x8},
+            {ESP_FLASH_SIZE_16MB,  0x9}, {-1, -1},
+        };
+        for (int i = 0; tbl[i].nibble != -1; i++) {
+            if (tbl[i].size == size) {
+                return tbl[i].nibble;
+            }
+        }
+        return -1;
+    }
+
+    /* ESP32 and all other chips. */
+    static const entry_t tbl[] = {
+        {ESP_FLASH_SIZE_1MB,   0x0}, {ESP_FLASH_SIZE_2MB,   0x1},
+        {ESP_FLASH_SIZE_4MB,   0x2}, {ESP_FLASH_SIZE_8MB,   0x3},
+        {ESP_FLASH_SIZE_16MB,  0x4}, {ESP_FLASH_SIZE_32MB,  0x5},
+        {ESP_FLASH_SIZE_64MB,  0x6}, {ESP_FLASH_SIZE_128MB, 0x7},
+        {-1, -1},
+    };
+    for (int i = 0; tbl[i].nibble != -1; i++) {
+        if (tbl[i].size == size) {
+            return tbl[i].nibble;
+        }
+    }
+    return -1;
+}
+
 /* Write the binary image into out_buf (caller guarantees capacity). */
 static void image_write(const uint8_t *elf_data,
+                        target_chip_t chip,
                         const esp_chip_info_t *ci,
                         const esp_loader_elf_cfg_t *cfg,
+                        uint8_t freq_nibble, uint8_t size_nibble,
                         const img_seg_t *segs, size_t n_segs,
                         size_t header_size, size_t n_written_segs,
                         uint8_t *out_buf)
@@ -532,9 +639,10 @@ static void image_write(const uint8_t *elf_data,
     /* ---- Base header (8 bytes) ---- */
     w_u8(out_buf, &pos, 0xE9u);                               /* magic */
     w_u8(out_buf, &pos, (uint8_t)n_written_segs);             /* segment count */
-    w_u8(out_buf, &pos, cfg->flash_mode);                     /* flash mode */
+    w_u8(out_buf, &pos, (uint8_t)cfg->flash_mode);             /* flash mode */
     w_u8(out_buf, &pos,                                        /* flash size | freq */
-         (uint8_t)((cfg->flash_size << 4u) | (cfg->flash_freq & 0x0Fu)));
+         (uint8_t)((size_nibble << 4u) | (freq_nibble & 0x0Fu)));
+    (void)chip;
     w_u32le(out_buf, &pos, ehdr->e_entry);                    /* entry point */
 
     /* ---- Extended header (16 bytes for ESP32+) ---- */
@@ -745,6 +853,13 @@ esp_loader_error_t esp_loader_elf_to_flash_image(
     size_t needed = layout_size(segs, n_segs, header_size, cfg->append_sha256,
                                 &n_written_segs);
 
+    /* Validate and encode chip-specific flash parameters. */
+    int8_t freq_nibble = encode_flash_freq(chip, cfg->flash_freq);
+    int8_t size_nibble = encode_flash_size(chip, cfg->flash_size);
+    if (freq_nibble < 0 || size_nibble < 0) {
+        return ESP_LOADER_ERROR_INVALID_PARAM;
+    }
+
     if (out_buf == NULL) {
         /* Dry-run: report required size and return. */
         *out_size = needed;
@@ -756,8 +871,8 @@ esp_loader_error_t esp_loader_elf_to_flash_image(
         return ESP_LOADER_ERROR_IMAGE_SIZE;
     }
 
-    image_write(elf_data, ci, cfg, segs, n_segs, header_size,
-                n_written_segs, out_buf);
+    image_write(elf_data, chip, ci, cfg, (uint8_t)freq_nibble, (uint8_t)size_nibble,
+                segs, n_segs, header_size, n_written_segs, out_buf);
     patch_app_elf_sha256(out_buf, needed, elf_data, elf_size, cfg->append_sha256);
     *out_size = needed;
     return ESP_LOADER_SUCCESS;
