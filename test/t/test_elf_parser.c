@@ -731,6 +731,183 @@ static void test_write(void)
 }
 
 /* -------------------------------------------------------------------------
+ * Flash parameter encoding tests
+ *
+ * Since esp_loader_elf_cfg_t now uses chip-agnostic enums, the encoding
+ * is done internally.  These tests verify:
+ *   (a) unsupported chip+freq / chip+size combos return INVALID_PARAM
+ *   (b) the encoded nibbles land in the right header bytes
+ * ---------------------------------------------------------------------- */
+
+/* Read header byte 3 (flash size | freq) from a generated image. */
+static uint8_t header_sf_byte(const uint8_t *elf, size_t elf_sz,
+                              target_chip_t chip,
+                              esp_flash_freq_t freq, esp_flash_size_t size)
+{
+    esp_loader_elf_cfg_t cfg = ESP_LOADER_ELF_CFG_DEFAULT();
+    cfg.flash_freq = freq;
+    cfg.flash_size = size;
+    size_t img_sz = 0;
+    uint8_t *img = NULL;
+
+    if (esp_loader_elf_to_flash_image(elf, elf_sz, chip, &cfg, NULL, &img_sz)
+            != ESP_LOADER_SUCCESS) {
+        return 0xFF; /* signal failure */
+    }
+    img = (uint8_t *)calloc(1, img_sz);
+    if (!img) {
+        return 0xFF;
+    }
+    if (esp_loader_elf_to_flash_image(elf, elf_sz, chip, &cfg,
+                                      img, &img_sz) != ESP_LOADER_SUCCESS) {
+        free(img);
+        return 0xFF;
+    }
+    uint8_t b = img[3];
+    free(img);
+    return b;
+}
+
+static void test_flash_encoding(void)
+{
+    size_t elf_sz = 0;
+    uint8_t *elf = make_elf(0, &elf_sz);
+
+    /* ---- unsupported chip+freq combos ---- */
+
+    {
+        esp_loader_elf_cfg_t cfg = ESP_LOADER_ELF_CFG_DEFAULT();
+        cfg.flash_freq = ESP_FLASH_FREQ_80M; /* not available on ESP32-C2 */
+        size_t out = 0;
+        tap_check(esp_loader_elf_to_flash_image(elf, elf_sz, ESP32C2_CHIP,
+                                                &cfg, NULL, &out)
+                  == ESP_LOADER_ERROR_INVALID_PARAM);
+        tap_done("encoding: 80 MHz not supported on ESP32-C2 → INVALID_PARAM");
+    }
+
+    {
+        esp_loader_elf_cfg_t cfg = ESP_LOADER_ELF_CFG_DEFAULT();
+        cfg.flash_freq = ESP_FLASH_FREQ_60M; /* C2-only, not on common chips */
+        size_t out = 0;
+        tap_check(esp_loader_elf_to_flash_image(elf, elf_sz, ESP32_CHIP,
+                                                &cfg, NULL, &out)
+                  == ESP_LOADER_ERROR_INVALID_PARAM);
+        tap_done("encoding: 60 MHz not supported on ESP32 → INVALID_PARAM");
+    }
+
+    {
+        esp_loader_elf_cfg_t cfg = ESP_LOADER_ELF_CFG_DEFAULT();
+        cfg.flash_freq = ESP_FLASH_FREQ_48M; /* H2-only */
+        size_t out = 0;
+        tap_check(esp_loader_elf_to_flash_image(elf, elf_sz, ESP32_CHIP,
+                                                &cfg, NULL, &out)
+                  == ESP_LOADER_ERROR_INVALID_PARAM);
+        tap_done("encoding: 48 MHz not supported on ESP32 → INVALID_PARAM");
+    }
+
+    {
+        esp_loader_elf_cfg_t cfg = ESP_LOADER_ELF_CFG_DEFAULT();
+        cfg.flash_freq = ESP_FLASH_FREQ_26M; /* common only, not on C2 */
+        size_t out = 0;
+        tap_check(esp_loader_elf_to_flash_image(elf, elf_sz, ESP32C2_CHIP,
+                                                &cfg, NULL, &out)
+                  == ESP_LOADER_ERROR_INVALID_PARAM);
+        tap_done("encoding: 26 MHz not supported on ESP32-C2 → INVALID_PARAM");
+    }
+
+    /* ---- unsupported chip+size combos ---- */
+
+    {
+        esp_loader_elf_cfg_t cfg = ESP_LOADER_ELF_CFG_DEFAULT();
+        cfg.flash_size = ESP_FLASH_SIZE_256KB; /* ESP8266 only */
+        size_t out = 0;
+        tap_check(esp_loader_elf_to_flash_image(elf, elf_sz, ESP32_CHIP,
+                                                &cfg, NULL, &out)
+                  == ESP_LOADER_ERROR_INVALID_PARAM);
+        tap_done("encoding: 256 KB not supported on ESP32 → INVALID_PARAM");
+    }
+
+    {
+        esp_loader_elf_cfg_t cfg = ESP_LOADER_ELF_CFG_DEFAULT();
+        cfg.flash_size = ESP_FLASH_SIZE_128MB; /* ESP32-family only */
+        size_t out = 0;
+        tap_check(esp_loader_elf_to_flash_image(elf, elf_sz, ESP8266_CHIP,
+                                                &cfg, NULL, &out)
+                  == ESP_LOADER_ERROR_INVALID_PARAM);
+        tap_done("encoding: 128 MB not supported on ESP8266 → INVALID_PARAM");
+    }
+
+    /* ---- header byte 2 (flash mode) ---- */
+
+    {
+        esp_loader_elf_cfg_t cfg = ESP_LOADER_ELF_CFG_DEFAULT();
+        cfg.flash_mode = ESP_FLASH_MODE_QIO;
+        size_t img_sz = 0;
+        uint8_t *img = NULL;
+        esp_loader_elf_to_flash_image(elf, elf_sz, ESP32_CHIP, &cfg, NULL, &img_sz);
+        img = (uint8_t *)calloc(1, img_sz);
+        esp_loader_elf_to_flash_image(elf, elf_sz, ESP32_CHIP, &cfg, img, &img_sz);
+        tap_check(img != NULL && img[2] == 0u); /* QIO = 0 */
+        tap_done("encoding: QIO mode → header byte 2 == 0");
+        free(img);
+    }
+
+    {
+        esp_loader_elf_cfg_t cfg = ESP_LOADER_ELF_CFG_DEFAULT();
+        cfg.flash_mode = ESP_FLASH_MODE_DIO;
+        size_t img_sz = 0;
+        uint8_t *img = NULL;
+        esp_loader_elf_to_flash_image(elf, elf_sz, ESP32_CHIP, &cfg, NULL, &img_sz);
+        img = (uint8_t *)calloc(1, img_sz);
+        esp_loader_elf_to_flash_image(elf, elf_sz, ESP32_CHIP, &cfg, img, &img_sz);
+        tap_check(img != NULL && img[2] == 2u); /* DIO = 2 */
+        tap_done("encoding: DIO mode → header byte 2 == 2");
+        free(img);
+    }
+
+    /* ---- header byte 3 (size<<4 | freq) — ESP32 family ---- */
+
+    /* 40 MHz + 4 MB on ESP32: freq nibble 0x0, size nibble 0x2 → 0x20 */
+    tap_check(header_sf_byte(elf, elf_sz, ESP32_CHIP,
+                             ESP_FLASH_FREQ_40M, ESP_FLASH_SIZE_4MB) == 0x20u);
+    tap_done("encoding: ESP32 40 MHz + 4 MB → header byte 3 == 0x20");
+
+    /* 80 MHz + 2 MB on ESP32: freq nibble 0xF, size nibble 0x1 → 0x1F */
+    tap_check(header_sf_byte(elf, elf_sz, ESP32_CHIP,
+                             ESP_FLASH_FREQ_80M, ESP_FLASH_SIZE_2MB) == 0x1Fu);
+    tap_done("encoding: ESP32 80 MHz + 2 MB → header byte 3 == 0x1F");
+
+    /* KEEP + DETECT on ESP32: freq nibble 0xF, size nibble 0xF → 0xFF */
+    tap_check(header_sf_byte(elf, elf_sz, ESP32_CHIP,
+                             ESP_FLASH_FREQ_KEEP, ESP_FLASH_SIZE_DETECT) == 0xFFu);
+    tap_done("encoding: ESP32 KEEP + DETECT → header byte 3 == 0xFF");
+
+    /* 60 MHz + 4 MB on ESP32-C2: freq nibble 0xF, size nibble 0x2 → 0x2F */
+    tap_check(header_sf_byte(elf, elf_sz, ESP32C2_CHIP,
+                             ESP_FLASH_FREQ_60M, ESP_FLASH_SIZE_4MB) == 0x2Fu);
+    tap_done("encoding: ESP32-C2 60 MHz + 4 MB → header byte 3 == 0x2F");
+
+    /* 48 MHz + 4 MB on ESP32-H2: freq nibble 0xF, size nibble 0x2 → 0x2F */
+    tap_check(header_sf_byte(elf, elf_sz, ESP32H2_CHIP,
+                             ESP_FLASH_FREQ_48M, ESP_FLASH_SIZE_4MB) == 0x2Fu);
+    tap_done("encoding: ESP32-H2 48 MHz + 4 MB → header byte 3 == 0x2F");
+
+    /* ---- header byte 3 — ESP8266 (different size table) ---- */
+
+    /* 40 MHz + 4 MB on ESP8266: freq 0x0, size 0x4 → 0x40 */
+    tap_check(header_sf_byte(elf, elf_sz, ESP8266_CHIP,
+                             ESP_FLASH_FREQ_40M, ESP_FLASH_SIZE_4MB) == 0x40u);
+    tap_done("encoding: ESP8266 40 MHz + 4 MB → header byte 3 == 0x40");
+
+    /* 40 MHz + 512 KB on ESP8266: freq 0x0, size 0x0 → 0x00 */
+    tap_check(header_sf_byte(elf, elf_sz, ESP8266_CHIP,
+                             ESP_FLASH_FREQ_40M, ESP_FLASH_SIZE_512KB) == 0x00u);
+    tap_done("encoding: ESP8266 40 MHz + 512 KB → header byte 3 == 0x00");
+
+    free(elf);
+}
+
+/* -------------------------------------------------------------------------
  * Real ELF tests (optional — skipped if TEST_ELF not set or file absent)
  * ---------------------------------------------------------------------- */
 
@@ -798,6 +975,7 @@ int main(void)
     test_chip_info();
     test_size_calc();
     test_write();
+    test_flash_encoding();
     test_real_elf();
     return tap_result();
 }

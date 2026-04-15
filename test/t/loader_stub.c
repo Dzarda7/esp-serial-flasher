@@ -16,10 +16,9 @@
 /*
  * Minimal stubs for the loader functions called by esp_elf_image.c.
  *
- * esp_loader_flash_elf() and esp_loader_load_elf_to_ram() dispatch through
- * these symbols at link time.  The host-side ELF parser tests never exercise
- * those two functions, but they share a compilation unit with the port-free
- * esp_loader_elf_to_flash_image(), so the linker still needs definitions.
+ * esp_loader_elf_to_flash_image() is port-free and does not call these
+ * symbols, but the loader headers declare them and some build systems pull
+ * in the full translation unit.  Providing stubs here keeps the link clean.
  *
  * All stubs return ESP_LOADER_ERROR_FAIL to make unintended calls obvious.
  */
