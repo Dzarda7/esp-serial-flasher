@@ -2,10 +2,48 @@
 
 ## Overview
 
-The two kinds of tests are written for serial flasher:
+Three kinds of tests are written for serial flasher:
 
+- Host unit tests (no hardware, no QEMU)
 - Qemu tests
 - Target tests
+
+## Host Unit Tests
+
+Pure C unit tests that run on the host machine. No ESP device, no QEMU, no
+ESP-IDF required. They cover the port-independent ELF→flash-image conversion
+path: ELF32 parser, segment classifier, image size calculator, and image write
+pass.
+
+### Running
+
+```bash
+bash test/t/0001-elf-parser.t
+```
+
+Or with [prove](https://perldoc.perl.org/prove) (part of Perl, available on
+most systems):
+
+```bash
+prove test/t/
+```
+
+### Environment variables
+
+| Variable    | Default                             | Description                                                                                          |
+| ----------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `CC`        | `cc`                                | C compiler to use                                                                                    |
+| `SAN_FLAGS` | _(empty)_                           | Extra compiler flags, e.g. `-fsanitize=address,undefined` when the sanitizer libraries are installed |
+| `TEST_ELF`  | auto-detected in-repo ESP32 fixture | Path to a `hello_world.elf` for the real-ELF tests. Set to an empty string to skip them.             |
+
+The driver automatically looks for the in-repo ESP32 fixture at
+`test/target-example-src/hello-world-ESP32-src/build-flash-esp32/hello_world.elf`
+when `TEST_ELF` is not set.
+
+### Platform support
+
+Linux and macOS. The shell driver requires bash; the compiled test binary itself
+is portable C99. Not supported on Windows without WSL or MSYS2.
 
 ## Qemu Tests
 
