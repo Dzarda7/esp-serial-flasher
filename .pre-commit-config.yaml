@@ -46,7 +46,7 @@ repos:
     rev: v2.4.2
     hooks:
       - id: codespell                                    # Code spell checker
-        args: ["--write-changes"]
+        args: ["--write-changes", "--ignore-words-list=dout"]
         exclude: |
             (?x)^(
               .+\.bin|
